@@ -120,6 +120,11 @@ class RingBuffer(object):
     See __init__().
 
     """
+    class Full(Exception):
+        pass
+
+    class Empty(Exception):
+        pass
 
     def __init__(self, elementsize, size):
         """Create an instance of PortAudio's ring buffer.
