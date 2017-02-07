@@ -2,6 +2,8 @@
 __version__ = '0.0.0'
 
 import sounddevice as _sd
+import time
+import queue
 from _rtmixer import ffi as _ffi, lib as _lib
 
 
@@ -23,7 +25,7 @@ class Mixer(_sd._StreamBase):
         callback = _ffi.addressof(_lib, 'callback')
 
         # TODO: parameter for ring buffer size
-        self._action_q = RingBuffer(_ffi.sizeof('struct action*'), 512)
+        self._action_q = RingBuffer(_ffi.sizeof('struct action*'), 128)
         self._userdata = _ffi.new('struct state*', dict(
             input_channels=0,
             output_channels=channels,
@@ -33,12 +35,10 @@ class Mixer(_sd._StreamBase):
             self, kind='output', wrap_callback=None, channels=channels,
             dtype='float32', callback=callback, userdata=self._userdata,
             **kwargs)
-        # Add a few attributes that are only known after opening the stream:
-        self._userdata.samplerate = self.samplerate
 
         self._actions = []
 
-    def play_buffer(self, buffer, channels, start=0):
+    def play_buffer(self, buffer, channels):
         """Send a buffer to the callback to be played back.
 
         After that, the *buffer* must not be written to anymore.
@@ -50,7 +50,6 @@ class Mixer(_sd._StreamBase):
         _, samplesize = _sd._split(self.samplesize)
         action = _ffi.new('struct action*', dict(
             actiontype=_lib.PLAY_BUFFER,
-            requested_time=start,
             # Cast to float* to allow playing bytes objects:
             buffer=_ffi.cast('float*', buffer),
             total_frames=len(buffer) // channels // samplesize,
@@ -64,7 +63,7 @@ class Mixer(_sd._StreamBase):
         assert ret == 1
         self._actions.append(action)  # TODO: Better way to keep alive?
 
-    def play_ringbuffer(self, ringbuffer, channels=None, start=0):
+    def play_ringbuffer(self, ringbuffer, channels=None):
         """Send a ring buffer to the callback to be played back.
 
         By default, the number of channels is obtained from the ring
@@ -80,7 +79,6 @@ class Mixer(_sd._StreamBase):
             raise ValueError('Incompatible elementsize')
         action = _ffi.new('struct action*', dict(
             actiontype=_lib.PLAY_RINGBUFFER,
-            requested_time=start,
             ringbuffer=ringbuffer._ptr,
             channels=channels,
             mapping=mapping,
@@ -213,6 +211,45 @@ class RingBuffer(object):
             if rest:
                 raise ValueError('data size must be multiple of elementsize')
         return _lib.PaUtil_ReadRingBuffer(self._ptr, data, size)
+
+    def get(self, buff, size=-1, timeout=1):
+        t1 = time.time()
+
+        if size < 0:
+            size, rest = divmod(len(buff), self._ptr.elementSizeBytes)
+            if rest:
+                raise ValueError('data size must be multiple of elementsize')
+
+        while True:
+            nframes = self.read_available
+            if nframes < size:
+                if timeout>0 and time.time()-t1 >= timeout: break
+                _sd.sleep(10)
+            else:
+                nframes = self.read(buff, size=size)
+                self.advance_read_index(nframes)
+                return nframes
+
+        raise queue.Empty("Timed out waiting for data.")
+
+    def put(self, data, timeout=-1):
+        t1 = time.time()
+
+        size, rest = divmod(len(data), self._ptr.elementSizeBytes)
+        if rest:
+            raise ValueError('data size must be multiple of elementsize')
+
+        while True:
+            nframes = self.write_available
+            if nframes < size:
+                if timeout>0 and time.time()-t1 >= timeout: break
+                _sd.sleep(10)
+            else:
+                nframes = self.write(data)
+                self.advance_write_index(nframes)
+                return nframes
+
+        raise queue.Full("Timed out waiting to write data.")
 
     def get_write_buffers(self, size):
         """Get buffer(s) to which we can write data.
